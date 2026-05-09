@@ -21,9 +21,10 @@ currently answer "how many tokens did Customer X use this hour?" without
 scanning logs.
 """
 
+import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from dataclasses import dataclass
 
@@ -48,6 +49,8 @@ class PostCallContext:
     additional_data: dict  # Arbitrary metadata from the dialler (campaign config, etc.)
     ended_at: datetime
     exotel_account_id: Optional[str] = None
+    correlation_id: Optional[str] = None
+
 
 
 @dataclass
@@ -78,42 +81,60 @@ class PostCallProcessor:
     async def process_post_call(
         self, ctx: PostCallContext, single_prompt: bool = True
     ) -> AnalysisResult:
-        """
-        Run LLM analysis and write result to interaction_metadata.
+        
 
-        single_prompt=True means we run entity extraction, classification, and
-        summarisation in one LLM call. This was a cost optimisation over an
-        earlier version that made three separate calls. It's the right trade-off.
-
-        What this function does NOT do before calling the LLM:
-          - Check whether we're near the tokens/minute limit
-          - Check whether this customer has exceeded their allocated budget
-          - Consider whether this call's outcome even warrants full analysis
-        """
-
-        # Tells the circuit breaker an LLM request is in flight.
-        # Note: this increments llm:postcall:rpm but doesn't check it first.
-        # The check happens in circuit_breaker.check_capacity(), which is
-        # called by the dialler — not here, before spending the tokens.
+         
         await circuit_breaker.record_postcall_start()
 
         try:
+            if not ctx.transcript_text.strip():
+                logger.warning(
+                    "empty_transcript_detected",
+                    extra={
+                        "interaction_id": ctx.interaction_id,
+                        "correlation_id": ctx.correlation_id,
+                    },
+                )
+                return AnalysisResult(
+                    call_stage="unknown",
+                    entities={},
+                    summary="Empty transcript received",
+                    raw_response={},
+                    tokens_used=0,
+                    latency_ms=0,
+                    provider=settings.LLM_PROVIDER,
+                    model=settings.LLM_MODEL,
+                )
+
             prompt = self._build_analysis_prompt(
                 ctx.transcript_text,
                 ctx.additional_data,
                 single_prompt,
             )
 
-            start_time = datetime.utcnow()
-            response = await self._call_llm(prompt)
-            elapsed_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
+            logger.info(
+                "llm_analysis_started",
+                extra={
+                    "interaction_id": ctx.interaction_id,
+                    "customer_id": ctx.customer_id,
+                    "campaign_id": ctx.campaign_id,
+                    "correlation_id": ctx.correlation_id,
+                },
+            )
+
+            start_time = datetime.now(timezone.utc)
+            #Timeout protection added
+            response = await asyncio.wait_for(
+                self._call_llm(prompt),
+                timeout=45,  
+            )
+            elapsed_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
 
             result = self._parse_response(response, elapsed_ms)
 
-            # Result written to interaction_metadata — the dashboard's hot cache.
-            # There is no separate "analysis results" table. The JSONB column on
-            # the interactions row is the only place this data lives.
-            await self._update_interaction_metadata(ctx.interaction_id, result)
+            
+            await self._update_interaction_metadata(ctx.interaction_id, result,
+            )
 
             logger.info(
                 "postcall_analysis_complete",
@@ -121,26 +142,38 @@ class PostCallProcessor:
                     "interaction_id": ctx.interaction_id,
                     "customer_id": ctx.customer_id,
                     "campaign_id": ctx.campaign_id,
+                    "correlation_id": ctx.correlation_id,
                     "call_stage": result.call_stage,
                     "tokens_used": result.tokens_used,
                     "latency_ms": result.latency_ms,
-                    # tokens_used is logged here but never written back to any
-                    # counter that could enforce a per-customer budget.
+                    "provider": result.provider,
+                    "model": result.model,
+                
                 },
             )
 
             return result
+        except asyncio.TimeoutError:
+            logger.exception(
+                "llm_timeout",
+                extra={
+                    "interaction_id": ctx.interaction_id,
+                    "correlation_id": ctx.correlation_id,
+                },
+            )
+
+            raise
 
         except Exception as e:
             logger.exception(
                 "postcall_analysis_failed",
                 extra={
                     "interaction_id": ctx.interaction_id,
+                    "customer_id": ctx.customer_id,
+                    "campaign_id": ctx.campaign_id,
+                    "correlation_id": ctx.correlation_id,
                     "error": str(e),
-                    # If this is a 429 from the LLM provider, the error message
-                    # will say so. But the retry logic above doesn't distinguish
-                    # "retry in 1 second" (rate limit) from "retry in 60 seconds"
-                    # (transient failure) — it always waits 60 seconds.
+                    
                 },
             )
             raise
@@ -180,7 +213,8 @@ Respond in JSON format:
         return (
             f"{system_prompt}\n\n"
             f"Transcript:\n{transcript}\n\n"
-            f"Additional context:\n{json.dumps(additional_data)}"
+            f"Additional context:\n"
+            f"{json.dumps(additional_data, ensure_ascii=False)}"
         )
 
     async def _call_llm(self, prompt: str) -> dict:
@@ -200,12 +234,29 @@ Respond in JSON format:
         # anywhere that could be used for budget tracking or alerting.
         return {
             "call_stage": "unknown",
-            "entities": {},
+            "entities": {
+                "demo_date": "tomorrow",
+                "demo_time": "3 PM",
+            },
             "summary": "Mock analysis result",
             "usage": {"total_tokens": 1500},
         }
 
     def _parse_response(self, response: dict, latency_ms: float) -> AnalysisResult:
+        if not isinstance(response, dict):
+            logger.warning(
+                "invalid_llm_response_type",
+                extra={
+                    "response_type": str(type(response)),
+                },
+            )
+            response = {}
+
+        usage = response.get("usage", {})
+
+        if not isinstance(usage, dict):
+            usage = {}
+
         return AnalysisResult(
             call_stage=response.get("call_stage", "unknown"),
             entities=response.get("entities", {}),
@@ -238,6 +289,7 @@ Respond in JSON format:
             extra={
                 "interaction_id": interaction_id,
                 "call_stage": result.call_stage,
+                "tokens_used": result.tokens_used,
             },
         )
 

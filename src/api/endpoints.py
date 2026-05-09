@@ -26,16 +26,16 @@ A few things to notice as you read this file:
    when, or why.
 """
 
-import asyncio
+
 import logging
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
 from src.tasks.celery_tasks import process_interaction_end_background_task
 
 logger = logging.getLogger(__name__)
@@ -46,9 +46,6 @@ class InteractionEndRequest(BaseModel):
     call_sid: Optional[str] = None
     duration_seconds: Optional[int] = None
     call_status: Optional[str] = None
-    # Arbitrary metadata from the telephony provider / dialler.
-    # In practice contains things like: dialler_campaign_id, lead_phone,
-    # call_attempt_number, agent_script_id. Passed through to the LLM prompt.
     additional_data: Optional[Dict[str, Any]] = None
 
 
@@ -66,123 +63,71 @@ async def end_interaction(
     session_id: UUID,
     interaction_id: UUID,
     request: InteractionEndRequest,
-    background_tasks: BackgroundTasks,
+    
 ):
-    """
-    End an interaction and trigger post-call processing.
-
-    Current flow:
-    1. Load interaction from DB
-    2. Mark status ENDED
-    3. Decide short vs long transcript
-       - Short (< 4 turns): fire signal jobs inline, skip LLM
-       - Long: dump everything into Celery, fire signal jobs anyway (empty payload)
-    4. Return 200 before anything actually processes
-    """
+    
     try:
         interaction = await _load_interaction(interaction_id)
 
         if not interaction:
             raise HTTPException(status_code=404, detail="Interaction not found")
+        assert interaction is not None
 
         await _update_interaction_status(
             interaction_id=str(interaction_id),
             status="ENDED",
-            ended_at=datetime.utcnow(),
+            ended_at=datetime.now(timezone.utc),
             duration=request.duration_seconds,
             call_sid=request.call_sid,
         )
 
         transcript = interaction.get("conversation_data", {}).get("transcript", [])
         is_short = len(transcript) < 4
+        
+        correlation_id = str(uuid.uuid4())
+        
+        transcript_text = "\n".join(
+            f"{turn.get('role', 'unknown')}: "
+            f"{turn.get('content', '')}"
+            for turn in transcript
+        )
 
-        if is_short:
-            # Fewer than 4 turns: wrong number, immediate hangup, network drop.
-            # Skip LLM — there's nothing meaningful to extract.
-            # Signal jobs still fire so the lead stage gets updated.
-            logger.info(
-                "short_transcript_fast_path",
-                extra={"interaction_id": str(interaction_id)},
-            )
+        celery_payload = {
+            "interaction_id": str(interaction_id),
+            "session_id": str(session_id),
+            "lead_id": interaction["lead_id"],
+            "campaign_id": interaction["campaign_id"],
+            "customer_id": interaction["customer_id"],
+            "agent_id": interaction["agent_id"],
+            "call_sid": request.call_sid,
+            "transcript_text": transcript_text,
+            "conversation_data": interaction.get("conversation_data", {}),
+            "additional_data": request.additional_data or {},
+            "ended_at": datetime.now(timezone.utc).isoformat(),
+            "is_short": is_short,
+            "correlation_id": correlation_id,
+        }
+        
 
-            # These asyncio.create_tasks share the FastAPI event loop.
-            # If the server restarts between the 200 response and these
-            # completing, they vanish with no trace. No retry, no record.
-            asyncio.create_task(
-                trigger_signal_jobs(
-                    interaction_id=str(interaction_id),
-                    session_id=str(session_id),
-                    campaign_id=interaction["campaign_id"],
-                    analysis_result={"call_stage": "short_call"},
-                )
-            )
-            asyncio.create_task(
-                update_lead_stage(
-                    lead_id=interaction["lead_id"],
-                    interaction_id=str(interaction_id),
-                    call_stage="short_call",
-                )
-            )
+        task = process_interaction_end_background_task.apply_async(
+            args=[celery_payload],
+            queue="postcall_processing",  # One queue to rule them all
+        )
 
-        else:
-            # Long transcript: pack everything into a Celery payload and enqueue.
-            # All calls get the same queue, same priority, same processing path —
-            # regardless of whether the call resulted in a confirmed booking or
-            # a customer hanging up after one sentence.
-            transcript_text = "\n".join(
-                f"{turn.get('role', 'unknown')}: {turn.get('content', '')}"
-                for turn in transcript
-            )
-
-            celery_payload = {
+        logger.info(
+            "postcall_enqueued",
+            extra={
                 "interaction_id": str(interaction_id),
-                "session_id": str(session_id),
-                "lead_id": interaction["lead_id"],
-                "campaign_id": interaction["campaign_id"],
-                "customer_id": interaction["customer_id"],
-                "agent_id": interaction["agent_id"],
-                "call_sid": request.call_sid,
-                "transcript_text": transcript_text,
-                "conversation_data": interaction.get("conversation_data", {}),
-                "additional_data": request.additional_data or {},
-                "ended_at": datetime.utcnow().isoformat(),
-                "exotel_account_id": interaction.get("exotel_account_id"),
-            }
+                "celery_task_id": task.id,
+                "correlation_id": correlation_id,
+                # Notice what's NOT logged here: no queue depth, no estimated
+                # wait time, no indication of how backed up we are.
+            },
+        )
 
-            task = process_interaction_end_background_task.apply_async(
-                args=[celery_payload],
-                queue="postcall_processing",  # One queue to rule them all
-            )
-
-            logger.info(
-                "postcall_enqueued",
-                extra={
-                    "interaction_id": str(interaction_id),
-                    "celery_task_id": task.id,
-                    # Notice what's NOT logged here: no queue depth, no estimated
-                    # wait time, no indication of how backed up we are.
-                },
-            )
-
-            # These fire immediately — before Celery has done anything.
-            # analysis_result={} means downstream gets an empty analysis.
-            # This was supposed to be a "best effort early trigger" but it
-            # mostly just sends empty payloads to signal_jobs.
-            asyncio.create_task(
-                trigger_signal_jobs(
-                    interaction_id=str(interaction_id),
-                    session_id=str(session_id),
-                    campaign_id=interaction["campaign_id"],
-                    analysis_result={},  # ← Celery hasn't run yet. This is empty.
-                )
-            )
-            asyncio.create_task(
-                update_lead_stage(
-                    lead_id=interaction["lead_id"],
-                    interaction_id=str(interaction_id),
-                    call_stage="processing",  # ← Placeholder, not a real outcome
-                )
-            )
+        # All downstream processing now happens inside Celery.
+        # This prevents empty analysis payloads and ensures retries
+        # remain consistent even after worker restarts.
 
         return InteractionEndResponse(
             status="ok",
@@ -219,7 +164,6 @@ async def _load_interaction(interaction_id: UUID) -> Optional[Dict[str, Any]]:
         "campaign_id": "mock-campaign-id",
         "customer_id": "mock-customer-id",
         "agent_id": "mock-agent-id",
-        "exotel_account_id": "mock-exotel-account",
         "conversation_data": {
             "transcript": [
                 {"role": "agent", "content": "Hello, am I speaking with Mr. Sharma?"},

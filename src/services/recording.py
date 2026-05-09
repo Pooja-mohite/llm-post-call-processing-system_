@@ -37,58 +37,99 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
+MAX_RECORDING_RETRIES = 6
+RECORDING_RETRY_DELAY_SECONDS = 10
+HTTP_TIMEOUT_SECONDS = 10
+
 
 async def fetch_and_upload_recording(
     interaction_id: str,
     call_sid: str,
     exotel_account_id: str,
+    correlation_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Attempt to fetch the Exotel recording and upload it to S3.
-
-    Current implementation: sleep 45s, try once, return None on failure.
-    Failure is logged at DEBUG level — effectively invisible in production
-    where the log level is INFO.
-
-    Returns the S3 key on success, None on failure or timeout.
+     
+    Improvements:
+    - Poll-based retry instead of fixed 45s sleep
+    - Better logging visibility
+    - Correlation ID tracing
+    - Retry attempt tracking
+    - Timeout protection
     """
-
-    # This sleep blocks the entire Celery task. While we're sleeping here,
-    # the LLM quota is sitting idle, the analysis hasn't started, and the
-    # dashboard still shows "processing" for what might be a confirmed rebook
-    # that the sales team is waiting to act on.
-    await asyncio.sleep(settings.RECORDING_WAIT_SECONDS)
-
-    try:
-        recording_url = await _fetch_exotel_recording_url(call_sid, exotel_account_id)
-
-        if not recording_url:
-            # Not available after 45s. We move on. No record that we tried.
-            # An ops engineer investigating "why is there no recording for
-            # interaction X?" has no log entry to find.
-            logger.debug(
-                "recording_not_available",
+    if not call_sid:
+        logger.warning(
+            "missing_call_sid",
+            extra={
+                "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
+            },
+        )
+        return None
+    for attempt in range(1, MAX_RECORDING_RETRIES + 1):
+        try:
+            logger.info(
+                "recording_fetch_attempt",
                 extra={
                     "interaction_id": interaction_id,
                     "call_sid": call_sid,
-                    "waited_seconds": settings.RECORDING_WAIT_SECONDS,
+                    "attempt": attempt,
+                    "correlation_id": correlation_id,
                 },
             )
-            return None
-
-        s3_key = await _upload_to_s3(recording_url, interaction_id)
-        return s3_key
-
-    except Exception as e:
-        # Exception is caught here and swallowed. The caller (Celery task)
-        # doesn't know whether this succeeded, failed, or was skipped.
-        # It logs at ERROR level, which is at least visible — but there's
-        # no retry path and no way to replay just the recording upload later.
-        logger.exception(
-            "recording_upload_error",
-            extra={"interaction_id": interaction_id, "error": str(e)},
-        )
-        return None
+            recording_url = await _fetch_exotel_recording_url(
+                call_sid=call_sid,
+                account_id=exotel_account_id,
+            )
+            if recording_url:
+                s3_key = await _upload_to_s3(
+                    recording_url=recording_url,
+                    interaction_id=interaction_id,
+                )
+                logger.info(
+                    "recording_pipeline_completed",
+                    extra={
+                        "interaction_id": interaction_id,
+                        "call_sid": call_sid,
+                        "s3_key": s3_key,
+                        "attempt": attempt,
+                        "correlation_id": correlation_id,
+                    },
+                )
+                return s3_key
+            logger.warning(
+                "recording_not_ready",
+                extra={
+                    "interaction_id": interaction_id,
+                    "call_sid": call_sid,
+                    "attempt": attempt,
+                    "retry_in_seconds": RECORDING_RETRY_DELAY_SECONDS,
+                    "correlation_id": correlation_id,
+                },
+            )
+            await asyncio.sleep(RECORDING_RETRY_DELAY_SECONDS)
+        except Exception as e:
+            logger.exception(
+                "recording_fetch_failed",
+                extra={
+                    "interaction_id": interaction_id,
+                    "call_sid": call_sid,
+                    "attempt": attempt,
+                    "correlation_id": correlation_id,
+                    "error": str(e),
+                },
+            )
+    logger.error(
+        "recording_pipeline_exhausted",
+        extra={
+            "interaction_id": interaction_id,
+            "call_sid": call_sid,
+            "max_retries": MAX_RECORDING_RETRIES,
+            "correlation_id": correlation_id,
+        },
+    )
+    return None
 
 
 async def _fetch_exotel_recording_url(
@@ -102,16 +143,48 @@ async def _fetch_exotel_recording_url(
     recording, e.g., call was never connected) look the same from here —
     both return None. A retry loop would want to handle these differently.
     """
-    url = f"https://api.exotel.com/v1/Accounts/{account_id}/Calls/{call_sid}/Recording"
-
+    url = (
+        f"https://api.exotel.com/v1/Accounts/"
+        f"{account_id}/Calls/{call_sid}/Recording"
+    )
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url)
-            if resp.status_code == 200:
-                data = resp.json()
+        async with httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT_SECONDS,
+        ) as client:
+            response = await client.get(url)
+
+            if response.status_code == 200:
+                data = response.json()
                 return data.get("recording_url")
+
+            if response.status_code == 404:
+                return None
+            logger.warning(
+                "unexpected_exotel_response",
+                extra={
+                    "call_sid": call_sid,
+                    "status_code": response.status_code,
+                },
+            )
+
             return None
-    except httpx.HTTPError:
+
+    except httpx.TimeoutException:
+        logger.warning(
+            "recording_request_timeout",
+            extra={
+                "call_sid": call_sid,
+            },
+        )
+        return None
+    except httpx.HTTPError as e:
+        logger.exception(
+            "recording_http_error",
+            extra={
+                "call_sid": call_sid,
+                "error": str(e),
+            },
+        )
         return None
 
 

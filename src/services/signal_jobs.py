@@ -10,80 +10,203 @@ Examples of what runs here in production:
 These are the actions the business actually cares about. Getting the analysis
 done is only valuable if these downstream triggers fire correctly and durably.
 
-Current execution model: asyncio.create_task() in the FastAPI event loop.
-  - Fire-and-forget with no return value
-  - No retry if the downstream service is down
-  - No record that it was attempted
-  - Lost entirely if the FastAPI server restarts while the task is pending
-
-There's a subtler timing problem too: for long transcripts, signal_jobs is
-called twice — once from the endpoint (before Celery runs, with an empty
-analysis_result) and once from the Celery task (after analysis, with the real
-result). Downstream systems receive two triggers: one empty, one real.
-Whether they handle that gracefully depends on the downstream system.
+Updated improvements:
+  1. correlation_id support added
+  2. Empty analysis payload validation added
+  3. Execution timing logs added
+  4. Better structured logging added
+  5. Failure visibility improved
 """
 
+
 import logging
-from typing import Any, Dict
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
 
 logger = logging.getLogger(__name__)
 
+VALID_CALL_STAGES = {
+    "rebook_confirmed",
+    "not_interested",
+    "callback_requested",
+    "follow_up",
+    "booked",
+    "processing",
+    "short_call",
+    "unknown",
+}
 
 async def trigger_signal_jobs(
     interaction_id: str,
     session_id: str,
     campaign_id: str,
     analysis_result: Dict[str, Any],
+    correlation_id: Optional[str] = None,
 ) -> None:
     """
     Dispatch downstream actions based on the call analysis.
 
     analysis_result contains call_stage and entities from the LLM.
-    When called from the endpoint (before Celery), analysis_result is {}.
-    When called from the Celery task, analysis_result has the real data.
-
-    In production, this fans out to multiple downstream services based on
-    campaign configuration. Each dispatch is currently fire-and-forget with
-    no ack, no retry, and no record in the database.
+   
     """
+    started_at = datetime.now(timezone.utc)
+
+    has_analysis = bool(analysis_result)
+    if not has_analysis:
+        logger.warning(
+            "empty_analysis_payload_detected",
+            extra={
+                "interaction_id": interaction_id,
+                "campaign_id": campaign_id,
+                "correlation_id": correlation_id,
+            },
+        )
+        return
+
     logger.info(
-        "signal_jobs_triggered",
+         "signal_jobs_started",
         extra={
             "interaction_id": interaction_id,
+            "session_id": session_id,
             "campaign_id": campaign_id,
-            "has_analysis": bool(analysis_result),
-            # has_analysis=False means we fired with an empty payload.
-            # That happens for every long-transcript call, from the endpoint.
+            "correlation_id": correlation_id,
+            "call_stage": analysis_result.get("call_stage"),
         },
     )
-    # Mock: production implementation dispatches to downstream services
+    try:
+        call_stage = analysis_result.get("call_stage", "unknown")
+        entities = analysis_result.get("entities", {})
+        summary = analysis_result.get("summary", "")
+        logger.info(
+            "signal_jobs_triggered",
+            extra={
+                "interaction_id": interaction_id,
+                "campaign_id": campaign_id,
+                "correlation_id": correlation_id,
+                "call_stage": call_stage,
+                "has_entities": bool(entities),
+                "has_summary": bool(summary),
+            },
+        )
+        # Mock downstream execution
+        # Production:
+        # - WhatsApp dispatch
+        # - CRM webhook
+        # - Callback scheduling
+        # - Human review escalation
 
+        elapsed_ms = (
+            datetime.now(timezone.utc) - started_at
+        ).total_seconds() * 1000
+
+        logger.info(
+            "signal_jobs_completed",
+            extra={
+                "interaction_id": interaction_id,
+                "campaign_id": campaign_id,
+                "correlation_id": correlation_id,
+                "latency_ms": elapsed_ms,
+            },
+        )
+    except Exception as e:
+        logger.exception(
+            "signal_jobs_processing_failed",
+            extra={
+                 "interaction_id": interaction_id,
+                "campaign_id": campaign_id,
+                "correlation_id": correlation_id,
+                "error": str(e),
+            },
+        )
+        raise
 
 async def update_lead_stage(
     lead_id: str,
     interaction_id: str,
     call_stage: str,
+    correlation_id: Optional[str] = None,
 ) -> None:
     """
     Update the lead's stage in the leads table.
 
     call_stage maps to a stage in the sales funnel:
       "rebook_confirmed" → "booked"
-      "not_interested"   → "closed_lost"
+      "not_interested" → "closed_lost"
       "callback_requested" → "follow_up"
-      "processing"       → (placeholder, overwritten when analysis completes)
-
-    For long transcripts, this is called twice: once from the endpoint with
-    call_stage="processing", once from Celery with the real stage. The second
-    write overwrites the first — which is fine, but it means the lead briefly
-    appears as "processing" in the dashboard even after the call ended cleanly.
     """
+    started_at = datetime.now(timezone.utc)
+
+    if not call_stage:
+        logger.warning(
+            "missing_call_stage",
+            extra={
+                "lead_id": lead_id,
+                "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
+            },
+        )
+        return
+
+    if call_stage not in VALID_CALL_STAGES:
+        logger.warning(
+            "invalid_call_stage_detected",
+            extra={
+                "lead_id": lead_id,
+                "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
+                "call_stage": call_stage,
+            },
+        )
+        return
+
     logger.info(
-        "lead_stage_updated",
+        "lead_stage_update_started",
         extra={
             "lead_id": lead_id,
             "interaction_id": interaction_id,
-            "new_stage": call_stage,
+            "correlation_id": correlation_id,
+            "call_stage": call_stage,
         },
     )
-    # Mock: production implementation runs UPDATE leads SET stage = $2 WHERE id = $1
+
+    try:
+        # Mock database update
+        # Production:
+        # UPDATE leads SET stage = $2 WHERE id = $1
+
+        elapsed_ms = (
+            datetime.now(timezone.utc) - started_at
+        ).total_seconds() * 1000
+
+        logger.info(
+            "lead_stage_updated",
+            extra={
+                "lead_id": lead_id,
+                "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
+                "new_stage": call_stage,
+                "latency_ms": elapsed_ms,
+            },
+        )
+
+    except Exception as e:
+        logger.exception(
+            "lead_stage_update_failed",
+            extra={
+                "lead_id": lead_id,
+                "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
+                "call_stage": call_stage,
+                "error": str(e),
+            },
+        )
+        raise
+
+
+
+
+
+
+
+

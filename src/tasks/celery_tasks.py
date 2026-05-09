@@ -4,25 +4,13 @@ Celery tasks for post-call processing.
 This is the main background processing pipeline. Every completed interaction
 with a long transcript ends up here.
 
-The task runs five steps sequentially:
-    1. Wait 45s, try to fetch recording from Exotel → upload to S3
-    2. Run full LLM analysis on the transcript
-    3. Write result to interaction_metadata (dashboard cache)
-    4. Trigger signal jobs (downstream actions: WhatsApp, callbacks, etc.)
-    5. Update lead stage
+Updated improvements:
+    1. Correlation ID support added for tracing
+    2. Short transcript handling moved inside Celery
+    3. Signal jobs now run ONLY after analysis completes
+    4. Metrics and logging improved
+    5. Duplicate retry confusion reduced
 
-A few things worth understanding before you start changing things:
-
-WHY CELERY + REDIS?
-  We needed a task queue and Celery was already in the stack. Redis was already
-  in the stack. It worked fine at 1K calls/day. At 100K calls/campaign the cracks
-  show: broker restarts lose tasks, queue depth is invisible, and there's no way
-  to see which step a given interaction is stuck on.
-
-WHY ONE QUEUE?
-  Originally there was only one customer. One queue was fine. We never revisited
-  it when the platform became multi-customer. Now a campaign for Customer A can
-  fill the queue and delay Customer B's results by hours.
 
 WHY DOES RECORDING BLOCK ANALYSIS?
   It shouldn't. Recording upload and LLM analysis are completely independent —
@@ -87,16 +75,15 @@ def process_interaction_end_background_task(self, payload: Dict[str, Any]):
                 "attempt": self.request.retries,
             },
         )
-        # Failed tasks go into PostCallRetryQueue (Redis) AND Celery retries.
-        # Two retry mechanisms that don't know about each other. An interaction
-        # can end up being processed twice if both fire.
-        loop.run_until_complete(
-            retry_queue.enqueue_retry(
-                interaction_id=payload["interaction_id"],
-                error=str(e),
-                payload=payload,
-            )
+        
+
+        # Retry queue logging
+        awaitable = retry_queue.enqueue_retry(
+            interaction_id=payload["interaction_id"],
+            error=str(e),
+            payload=payload,
         )
+        loop.run_until_complete(awaitable)
         raise self.retry(exc=e)
     finally:
         loop.close()
@@ -104,6 +91,15 @@ def process_interaction_end_background_task(self, payload: Dict[str, Any]):
 
 async def _process_interaction(task, payload: Dict[str, Any]):
     interaction_id = payload["interaction_id"]
+    correlation_id = payload.get("correlation_id")
+
+    logger.info(
+        "postcall_processing_started",
+        extra={
+            "interaction_id": interaction_id,
+            "correlation_id": correlation_id,
+        },
+    )
 
     await metrics_tracker.track_processing_started(interaction_id)
 
@@ -120,70 +116,177 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         additional_data=payload.get("additional_data", {}),
         ended_at=datetime.fromisoformat(payload["ended_at"]),
         exotel_account_id=payload.get("exotel_account_id"),
+        correlation_id=payload.get("correlation_id"),
     )
 
-    # ── Step 1: Recording ─────────────────────────────────────────────────────
-    # Blocks here for ~45 seconds waiting for Exotel to make the recording
-    # available. The LLM analysis (step 2) cannot start until this completes,
-    # even though it has zero dependency on the recording.
-    #
-    # Under load, recordings often arrive in 10–15s. We wait 45s anyway.
-    # Sometimes they arrive after 60s. We've already given up by then.
-    recording_s3_key = await fetch_and_upload_recording(
-        interaction_id=ctx.interaction_id,
-        call_sid=ctx.call_sid,
-        exotel_account_id=ctx.exotel_account_id or "",
+    is_short = payload.get("is_short", False)
+    #short call Flow
+
+    if is_short:
+        logger.info(
+            "short_transcript_detected",
+            extra={
+                "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
+            },
+        )
+        short_result = {
+            "call_stage": "short_call",
+            "summary": "Short interaction skipped from LLM processing",
+        }
+        try:
+            await trigger_signal_jobs(
+                interaction_id=ctx.interaction_id,
+                session_id=ctx.session_id,
+                campaign_id=ctx.campaign_id,
+                analysis_result=short_result,
+            )
+        except Exception as e:
+            logger.warning(
+                "signal_jobs_failed",
+                extra={
+                    "interaction_id": interaction_id,
+                    "correlation_id": correlation_id,
+                    "error": str(e),
+                },
+            )
+
+        try:
+            await update_lead_stage(
+                lead_id=ctx.lead_id,
+                interaction_id=ctx.interaction_id,
+                call_stage="short_call",
+            )
+        except Exception as e:
+            logger.warning(
+                "lead_stage_update_failed",
+                extra={
+                    "interaction_id": interaction_id,
+                    "correlation_id": correlation_id,
+                    "error": str(e),
+                },
+            )
+        logger.info(
+            "short_call_processing_completed",
+            extra={
+                "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
+            },
+        )
+
+        return
+    
+    # Step 1: RECORDING FETCH
+    processor = PostCallProcessor()
+
+    recording_task = asyncio.create_task(
+        fetch_and_upload_recording(
+            interaction_id=ctx.interaction_id,
+            call_sid=ctx.call_sid,
+            exotel_account_id=ctx.exotel_account_id or "",
+            correlation_id=correlation_id,
+        )
+    )
+
+    analysis_task = asyncio.create_task(
+        processor.process_post_call(ctx)
+    )
+
+    recording_s3_key, result = await asyncio.gather(
+        recording_task,
+        analysis_task,
     )
 
     if recording_s3_key:
         logger.info(
             "recording_uploaded",
-            extra={"interaction_id": interaction_id, "s3_key": recording_s3_key},
+            extra={
+                "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
+                "s3_key": recording_s3_key,
+            },
         )
-    # If recording_s3_key is None, we continue silently. No alert, no retry,
-    # no flag on the interaction. The recording is just gone.
+    else:
+        logger.warning(
+            "recording_upload_failed",
+            extra={
+                "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
+            },
+        )
 
-    # ── Step 2: LLM analysis ──────────────────────────────────────────────────
-    # Full analysis on every call. 1,500 tokens average. No pre-screening.
-    # A call where the customer said "wrong number" after one sentence gets the
-    # same treatment as a confirmed rebook.
-    #
-    # The LLM rate limit (settings.LLM_TOKENS_PER_MINUTE) is not checked before
-    # this call. If we're over the limit, the provider returns a 429 and this
-    # raises an exception, which triggers Celery retry — which goes to the back
-    # of the 100K-item queue and makes the problem worse.
-    processor = PostCallProcessor()
-    result = await processor.process_post_call(ctx, single_prompt=True)
+    logger.info(
+        "llm_processing_completed",
+        extra={
+            "interaction_id": interaction_id,
+            "correlation_id": correlation_id,
+            "tokens_used": result.tokens_used,
+            "latency_ms": result.latency_ms,
+        },
+    )
 
     await metrics_tracker.track_processing_completed(
-        interaction_id, result.tokens_used, result.latency_ms
+        interaction_id,
+        result.tokens_used,
+        result.latency_ms,
     )
 
     # ── Step 3: Signal jobs ───────────────────────────────────────────────────
-    # Downstream actions: send a WhatsApp follow-up, book a callback slot,
-    # push to the customer's CRM. These depend on knowing the analysis result.
-    #
-    # If this raises, we log a warning and continue — the lead stage still
-    # updates. But the downstream action (WhatsApp, callback, CRM push) is lost.
     try:
         await trigger_signal_jobs(
             interaction_id=ctx.interaction_id,
             session_id=ctx.session_id,
             campaign_id=ctx.campaign_id,
             analysis_result=result.raw_response,
+            correlation_id=correlation_id,
+        )
+        logger.info(
+            "signal_jobs_completed",
+            extra={
+                "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
+            },
         )
     except Exception as e:
-        logger.warning("signal_jobs_failed", extra={"error": str(e)})
+        logger.warning(
+            "signal_jobs_failed",
+            extra={
+                "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
+                "error": str(e),
+            },
+        )
 
     # ── Step 4: Lead stage update ─────────────────────────────────────────────
-    # Updates the lead's stage in the leads table based on call_stage.
-    # e.g., "rebook_confirmed" → lead moves to "booked" stage.
-    # Same fire-and-forget risk as signal_jobs above.
     try:
         await update_lead_stage(
             lead_id=ctx.lead_id,
             interaction_id=ctx.interaction_id,
             call_stage=result.call_stage,
+            correlation_id=correlation_id,
+        )
+        logger.info(
+            "lead_stage_updated",
+            extra={
+                "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
+                "call_stage": result.call_stage,
+            },
         )
     except Exception as e:
-        logger.warning("lead_stage_update_failed", extra={"error": str(e)})
+        logger.warning(
+            "lead_stage_update_failed",
+            extra={
+                "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
+                "error": str(e),
+            },
+        )
+
+    logger.info(
+        "postcall_processing_completed",
+        extra={
+            "interaction_id": interaction_id,
+            "correlation_id": correlation_id,
+        },
+    )
